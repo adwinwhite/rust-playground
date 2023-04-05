@@ -42,7 +42,7 @@ pub enum Mode {
 pub enum Edition {
     Rust2015,
     Rust2018,
-    Rust2021, // TODO - add parallel tests for 2021
+    Rust2021,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, strum::IntoStaticStr)]
@@ -80,4 +80,3 @@ pub struct CompileResponse {
     pub stdout: String,
     pub stderr: String,
 }
-
