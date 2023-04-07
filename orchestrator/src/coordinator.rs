@@ -496,14 +496,16 @@ pub fn spawn_container(project_dir: &Path) -> Result<Container> {
     let (playground_msg_tx, playground_msg_rx) = mpsc::channel(8);
     let (container_msg_tx, container_msg_rx) = mpsc::channel(8);
     let (kind_tx, kind_rx) = mpsc::channel(8);
-    tasks.spawn(async move {
-        lower_operations(playground_msg_rx, coordinator_msg_tx, kind_tx).await?;
-        Ok(())
-    });
-    tasks.spawn(async move {
-        lift_operation_results(worker_msg_rx, container_msg_tx, kind_rx).await?;
-        Ok(())
-    });
+    tasks.spawn(lower_operations(
+        playground_msg_rx,
+        coordinator_msg_tx,
+        kind_tx,
+    ));
+    tasks.spawn(lift_operation_results(
+        worker_msg_rx,
+        container_msg_tx,
+        kind_rx,
+    ));
     tokio::spawn(async move {
         if let Some(task) = tasks.join_next().await {
             eprintln!("{task:?}");
