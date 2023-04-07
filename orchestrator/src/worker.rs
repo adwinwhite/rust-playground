@@ -7,9 +7,8 @@ use std::{
 };
 use tokio::{
     fs,
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, BufReader},
     process::{Child, Command},
-    select,
     sync::{mpsc, Notify},
     task::{JoinHandle, JoinSet},
 };
@@ -43,28 +42,11 @@ pub enum Error {
     #[snafu(display("Failed to spawn child process"))]
     UnableToSpawnProcess { source: std::io::Error },
 
-    #[snafu(display("Failed to capture child process stdin"))]
-    UnableToCaptureStdin,
-
     #[snafu(display("Failed to capture child process stdout"))]
     UnableToCaptureStdout,
 
     #[snafu(display("Failed to capture child process stderr"))]
     UnableToCaptureStderr,
-
-    #[snafu(display("Failed to send stdin data"))]
-    UnableToSendStdinData {
-        source: mpsc::error::SendError<String>,
-    },
-
-    #[snafu(display("Failed to receive stdin data"))]
-    UnableToReceiveStdinData,
-
-    #[snafu(display("Failed to write stdin data"))]
-    UnableToWriteStdin { source: std::io::Error },
-
-    #[snafu(display("Failed to flush stdin data"))]
-    UnableToFlushStdin { source: std::io::Error },
 
     #[snafu(display("Failed to read child process stdout"))]
     UnableToReadStdout { source: std::io::Error },
@@ -74,11 +56,6 @@ pub enum Error {
 
     #[snafu(display("Failed to flush stdout"))]
     UnableToFlushStdout { source: std::io::Error },
-
-    #[snafu(display("Failed to send stdin packet"))]
-    UnableToSendStdinPacket {
-        source: mpsc::error::SendError<(CommandId, String)>,
-    },
 
     #[snafu(display("Failed to send stdout packet"))]
     UnableToSendStdoutPacket {
@@ -117,9 +94,6 @@ pub enum Error {
 
     #[snafu(display("Command request recevier ended unexpectedly"))]
     CommandRequestReceiverEnded,
-
-    #[snafu(display("Stdin packet recevier ended unexpectedly"))]
-    StdinReceiverEnded,
 }
 
 pub async fn listen(project_dir: PathBuf) -> Result<()> {
@@ -129,10 +103,8 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
     spawn_io_queue(&mut tasks, coordinator_msg_tx, worker_msg_rx);
 
     let (cmd_tx, cmd_rx) = mpsc::channel(8);
-    let (stdin_tx, stdin_rx) = mpsc::channel(8);
     tokio::spawn(manage_processes(
         worker_msg_tx.clone(),
-        stdin_rx,
         cmd_rx,
         project_dir.clone(),
     ));
@@ -184,12 +156,6 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
                     });
 
                     current_job = Some(task_handle);
-                }
-                CoordinatorMessage::StdinPacket(cmd_id, data) => {
-                    stdin_tx
-                        .send((cmd_id, data))
-                        .await
-                        .context(UnableToSendStdinPacketSnafu)?;
                 }
             }
         }
@@ -251,80 +217,49 @@ async fn handle_request(
 
 async fn manage_processes(
     worker_msg_tx: mpsc::Sender<WorkerMessage>,
-    mut stdin_rx: mpsc::Receiver<(CommandId, String)>,
     mut cmd_rx: mpsc::Receiver<CommandRequest>,
     project_path: PathBuf,
 ) -> Result<()> {
     let mut processes = HashMap::new();
-    let mut stdin_senders: HashMap<(u64, u64), mpsc::Sender<String>> = HashMap::new();
     loop {
-        select! {
-            cmd_req = cmd_rx.recv() => {
-                let (cmd_id, req, response_tx) = cmd_req.context(CommandRequestReceiverEndedSnafu)?;
-                let ExecuteCommandRequest {
-                    cmd,
-                    args,
-                    envs,
-                    cwd,
-                } = req;
-                let mut child = Command::new(cmd)
-                    .args(args)
-                    .envs(envs)
-                    .current_dir(parse_working_dir(cwd, project_path.as_path()))
-                    .kill_on_drop(true)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn().context(UnableToSpawnProcessSnafu)?;
+        let cmd_req = cmd_rx.recv().await;
+        let (cmd_id, req, response_tx) = cmd_req.context(CommandRequestReceiverEndedSnafu)?;
+        let ExecuteCommandRequest {
+            cmd,
+            args,
+            envs,
+            cwd,
+        } = req;
+        let mut child = Command::new(cmd)
+            .args(args)
+            .envs(envs)
+            .current_dir(parse_working_dir(cwd, project_path.as_path()))
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context(UnableToSpawnProcessSnafu)?;
 
-                // Preparing for receiving stdin packet.
-                let (stdin_tx, stdin_rx) = mpsc::channel(8);
-                stdin_senders.insert(cmd_id, stdin_tx);
-
-                let mut task_set = stream_stdio(worker_msg_tx.clone(), stdin_rx, &mut child, cmd_id)?;
-                task_set.spawn(async move {
-                    child.wait().await.context(WaitChildSnafu)?;
-                    response_tx.notify_one();
-                    Ok(())
-                });
-                processes.insert(cmd_id, task_set);
-            }
-            stdin_packet = stdin_rx.recv() => {
-                // Dispatch stdin packet to different child by attached command id.
-                let (cmd_id, packet) = stdin_packet.context(StdinReceiverEndedSnafu)?;
-                if let Some(stdin_tx) = stdin_senders.get(&cmd_id) {
-                    stdin_tx.send(packet).await.context(UnableToSendStdinDataSnafu)?;
-                }
-            }
-        }
+        let mut task_set = stream_stdio(worker_msg_tx.clone(), &mut child, cmd_id)?;
+        task_set.spawn(async move {
+            child.wait().await.context(WaitChildSnafu)?;
+            response_tx.notify_one();
+            Ok(())
+        });
+        processes.insert(cmd_id, task_set);
     }
 }
 
 fn stream_stdio(
     coordinator_tx: mpsc::Sender<WorkerMessage>,
-    mut stdin_rx: mpsc::Receiver<String>,
     child: &mut Child,
     cmd_id: CommandId,
 ) -> Result<JoinSet<Result<()>>> {
-    let mut stdin = child.stdin.take().context(UnableToCaptureStdinSnafu)?;
     let stdout = child.stdout.take().context(UnableToCaptureStdoutSnafu)?;
     let stderr = child.stderr.take().context(UnableToCaptureStderrSnafu)?;
 
     let mut set = JoinSet::new();
 
-    set.spawn(async move {
-        loop {
-            let data = stdin_rx
-                .recv()
-                .await
-                .context(UnableToReceiveStdinDataSnafu)?;
-            stdin
-                .write_all(data.as_bytes())
-                .await
-                .context(UnableToWriteStdinSnafu)?;
-            stdin.flush().await.context(UnableToFlushStdinSnafu)?;
-        }
-    });
     let coordinator_tx_out = coordinator_tx.clone();
     set.spawn(async move {
         let mut stdout_buf = BufReader::new(stdout);

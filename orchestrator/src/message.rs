@@ -31,7 +31,6 @@ impl JobReport {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CoordinatorMessage {
     Request(JobId, Job),
-    StdinPacket(CommandId, String),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

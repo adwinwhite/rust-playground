@@ -143,7 +143,6 @@ pub type RequestId = u64;
 #[derive(Debug)]
 pub enum PlaygroundMessage {
     Request(RequestId, HighLevelRequest),
-    StdinPacket(CommandId, String),
 }
 
 #[derive(Debug)]
@@ -234,11 +233,6 @@ pub enum Error {
 
     #[snafu(display("Failed to send job"))]
     UnableToSendJob {
-        source: mpsc::error::SendError<CoordinatorMessage>,
-    },
-
-    #[snafu(display("Failed to send stdin packet"))]
-    UnableToSendStdinPacket {
         source: mpsc::error::SendError<CoordinatorMessage>,
     },
 
@@ -555,12 +549,6 @@ async fn lower_operations(
                     .send(coordinator_msg)
                     .await
                     .context(UnableToSendJobSnafu)?;
-            }
-            PlaygroundMessage::StdinPacket(cmd_id, data) => {
-                coordinator_msg_tx
-                    .send(CoordinatorMessage::StdinPacket(cmd_id, data))
-                    .await
-                    .context(UnableToSendStdinPacketSnafu)?;
             }
         }
     }
