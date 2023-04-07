@@ -9,6 +9,7 @@ use tokio::{
     fs,
     io::{AsyncBufReadExt, BufReader},
     process::{Child, Command},
+    select,
     sync::{mpsc, Notify},
     task::{JoinHandle, JoinSet},
 };
@@ -20,6 +21,7 @@ use crate::message::{
 };
 
 type CommandRequest = (CommandId, ExecuteCommandRequest, Arc<Notify>);
+type CancelRequest = JobId;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -37,6 +39,11 @@ pub enum Error {
     #[snafu(display("Failed to send command execution request"))]
     UnableToSendCommandExecutionRequest {
         source: mpsc::error::SendError<CommandRequest>,
+    },
+
+    #[snafu(display("Failed to send command execution request"))]
+    UnableToSendCommandCancellationRequest {
+        source: mpsc::error::SendError<CancelRequest>,
     },
 
     #[snafu(display("Failed to spawn child process"))]
@@ -94,6 +101,9 @@ pub enum Error {
 
     #[snafu(display("Command request recevier ended unexpectedly"))]
     CommandRequestReceiverEnded,
+
+    #[snafu(display("Command cancellation recevier ended unexpectedly"))]
+    CancelRequestReceiverEnded,
 }
 
 pub async fn listen(project_dir: PathBuf) -> Result<()> {
@@ -103,14 +113,16 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
     spawn_io_queue(&mut tasks, coordinator_msg_tx, worker_msg_rx);
 
     let (cmd_tx, cmd_rx) = mpsc::channel(8);
-    tokio::spawn(manage_processes(
+    let (cancel_tx, cancel_rx) = mpsc::channel(8);
+    tasks.spawn(manage_processes(
         worker_msg_tx.clone(),
         cmd_rx,
+        cancel_rx,
         project_dir.clone(),
     ));
     tasks.spawn(async move {
         // TODO: may change this to a hashmap to allow multiple concurrent jobs.
-        let mut current_job: Option<JoinHandle<Result<()>>> = None;
+        let mut current_job: Option<(JobId, JoinHandle<Result<()>>)> = None;
 
         let project_path = project_dir.as_path();
         loop {
@@ -120,8 +132,13 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
                 .context(UnableToReceiveCoordinatorMessageSnafu)?;
             match coordinator_msg {
                 CoordinatorMessage::Request(job_id, job) => {
-                    if let Some(current_job) = current_job {
-                        current_job.abort();
+                    if let Some((job_id, job_task)) = current_job {
+                        job_task.abort();
+                        // Kill process started by this job.
+                        cancel_tx
+                            .send(job_id)
+                            .await
+                            .context(UnableToSendCommandCancellationRequestSnafu)?;
                     }
 
                     let worker_msg_tx = worker_msg_tx.clone();
@@ -155,7 +172,7 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
                         Ok(())
                     });
 
-                    current_job = Some(task_handle);
+                    current_job = Some((job_id, task_handle));
                 }
             }
         }
@@ -218,35 +235,45 @@ async fn handle_request(
 async fn manage_processes(
     worker_msg_tx: mpsc::Sender<WorkerMessage>,
     mut cmd_rx: mpsc::Receiver<CommandRequest>,
+    mut cancel_rx: mpsc::Receiver<CancelRequest>,
     project_path: PathBuf,
 ) -> Result<()> {
     let mut processes = HashMap::new();
     loop {
-        let cmd_req = cmd_rx.recv().await;
-        let (cmd_id, req, response_tx) = cmd_req.context(CommandRequestReceiverEndedSnafu)?;
-        let ExecuteCommandRequest {
-            cmd,
-            args,
-            envs,
-            cwd,
-        } = req;
-        let mut child = Command::new(cmd)
-            .args(args)
-            .envs(envs)
-            .current_dir(parse_working_dir(cwd, project_path.as_path()))
-            .kill_on_drop(true)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context(UnableToSpawnProcessSnafu)?;
+        select! {
+            cmd_req = cmd_rx.recv() => {
+                let (cmd_id, req, response_tx) = cmd_req.context(CommandRequestReceiverEndedSnafu)?;
+                let ExecuteCommandRequest {
+                    cmd,
+                    args,
+                    envs,
+                    cwd,
+                } = req;
+                let mut child = Command::new(cmd)
+                    .args(args)
+                    .envs(envs)
+                    .current_dir(parse_working_dir(cwd, project_path.as_path()))
+                    .kill_on_drop(true)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .context(UnableToSpawnProcessSnafu)?;
 
-        let mut task_set = stream_stdio(worker_msg_tx.clone(), &mut child, cmd_id)?;
-        task_set.spawn(async move {
-            child.wait().await.context(WaitChildSnafu)?;
-            response_tx.notify_one();
-            Ok(())
-        });
-        processes.insert(cmd_id, task_set);
+                let mut task_set = stream_stdio(worker_msg_tx.clone(), &mut child, cmd_id)?;
+                task_set.spawn(async move {
+                    child.wait().await.context(WaitChildSnafu)?;
+                    response_tx.notify_one();
+                    Ok(())
+                });
+                processes.insert(cmd_id.0, task_set);
+            },
+            job_id = cancel_rx.recv() => {
+                let job_id = job_id.context(CancelRequestReceiverEndedSnafu)?;
+                if let Some(task_set) = processes.get_mut(&job_id) {
+                    task_set.shutdown().await;
+                }
+            },
+        }
     }
 }
 
