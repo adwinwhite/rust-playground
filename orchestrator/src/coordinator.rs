@@ -18,7 +18,10 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tokio_util::io::SyncIoBridge;
 
 use crate::{
-    message::{CommandId, CoordinatorMessage, Job, JobReport, WorkerMessage},
+    message::{
+        CommandId, CoordinatorMessage, Job, JobReport, MessageId, TaggedCoordinatorMessage,
+        TaggedWorkerMessage, WorkerMessage,
+    },
     sandbox::{CompileRequest, CompileResponse},
 };
 
@@ -27,10 +30,14 @@ enum FanoutCommand {
     Listen(u64, mpsc::Sender<ContainerMessage>),
 }
 
+type TaggedContainerMessage = (MessageId, ContainerMessage);
+type TaggedPlaygroundMessage = (MessageId, PlaygroundMessage);
+type TaggedRequestKind = (MessageId, RequestKind);
+
 #[derive(Debug)]
 pub struct Container {
     child: Child,
-    tx: mpsc::Sender<PlaygroundMessage>,
+    tx: mpsc::Sender<TaggedPlaygroundMessage>,
     command_tx: mpsc::Sender<FanoutCommand>,
     id: AtomicU64,
 }
@@ -38,7 +45,7 @@ pub struct Container {
 impl Container {
     async fn fanout(
         mut command_rx: mpsc::Receiver<FanoutCommand>,
-        mut rx: mpsc::Receiver<ContainerMessage>,
+        mut rx: mpsc::Receiver<TaggedContainerMessage>,
     ) {
         let mut waiting = HashMap::new();
 
@@ -55,8 +62,7 @@ impl Container {
                 },
 
                 msg = rx.recv() => {
-                    let msg = msg.expect("Handle this");
-                    let id = 0; // TODO: some uniform way of getting the ID for _any_ message
+                    let (id, msg) = msg.expect("Handle this");
                     if let Some(waiter) = waiting.get(&id) {
                         waiter.send(msg).await.ok(/* Don't care about it */);
                     }
@@ -104,9 +110,9 @@ impl Container {
             .await
             .unwrap();
         to_worker_tx
-            .send(PlaygroundMessage::Request(
+            .send((
                 id,
-                HighLevelRequest::Compile(request),
+                PlaygroundMessage::Request(HighLevelRequest::Compile(request)),
             ))
             .await
             .expect("handle this");
@@ -117,7 +123,7 @@ impl Container {
         let x = tokio::spawn(async move {
             while let Some(container_msg) = from_worker_rx.recv().await {
                 match container_msg {
-                    ContainerMessage::Response(_, resp) => match resp {
+                    ContainerMessage::Response(resp) => match resp {
                         HighLevelResponse::Compile(resp) => return Ok(resp),
                     },
                     ContainerMessage::StdoutPacket(_, packet) => {
@@ -138,16 +144,14 @@ impl Container {
     }
 }
 
-pub type RequestId = u64;
-
 #[derive(Debug)]
 pub enum PlaygroundMessage {
-    Request(RequestId, HighLevelRequest),
+    Request(HighLevelRequest),
 }
 
 #[derive(Debug)]
 pub enum ContainerMessage {
-    Response(RequestId, HighLevelResponse),
+    Response(HighLevelResponse),
     StdoutPacket(CommandId, String),
     StderrPacket(CommandId, String),
 }
@@ -209,7 +213,7 @@ pub enum Error {
 
     #[snafu(display("Failed to send worker message through channel"))]
     UnableToSendWorkerMessage {
-        source: mpsc::error::SendError<WorkerMessage>,
+        source: mpsc::error::SendError<TaggedWorkerMessage>,
     },
 
     #[snafu(display("Failed to receive worker message through channel"))]
@@ -228,27 +232,27 @@ pub enum Error {
 
     #[snafu(display("Failed to send request kind"))]
     UnableToSendRequestKind {
-        source: mpsc::error::SendError<(RequestId, RequestKind)>,
+        source: mpsc::error::SendError<TaggedRequestKind>,
     },
 
     #[snafu(display("Failed to send job"))]
     UnableToSendJob {
-        source: mpsc::error::SendError<CoordinatorMessage>,
+        source: mpsc::error::SendError<TaggedCoordinatorMessage>,
     },
 
     #[snafu(display("Failed to send container respones"))]
     UnableToSendContainerResponse {
-        source: mpsc::error::SendError<ContainerMessage>,
+        source: mpsc::error::SendError<TaggedContainerMessage>,
     },
 
     #[snafu(display("Failed to send stdout packet"))]
     UnableToSendStdoutPacket {
-        source: mpsc::error::SendError<ContainerMessage>,
+        source: mpsc::error::SendError<TaggedContainerMessage>,
     },
 
     #[snafu(display("Failed to send stderr packet"))]
     UnableToSendStderrPacket {
-        source: mpsc::error::SendError<ContainerMessage>,
+        source: mpsc::error::SendError<TaggedContainerMessage>,
     },
 
     #[snafu(display("PlaygroundMessage receiver ended unexpectedly"))]
@@ -443,8 +447,8 @@ fn spawn_io_queue(
     stdin: ChildStdin,
     stdout: ChildStdout,
 ) -> (
-    mpsc::Sender<CoordinatorMessage>,
-    mpsc::Receiver<WorkerMessage>,
+    mpsc::Sender<TaggedCoordinatorMessage>,
+    mpsc::Receiver<TaggedWorkerMessage>,
 ) {
     use std::io::{prelude::*, BufReader, BufWriter};
 
@@ -529,26 +533,26 @@ pub fn spawn_container(project_dir: &Path) -> Result<Container> {
 }
 
 async fn lower_operations(
-    mut playground_msg_rx: mpsc::Receiver<PlaygroundMessage>,
-    coordinator_msg_tx: mpsc::Sender<CoordinatorMessage>,
-    kind_tx: mpsc::Sender<(RequestId, RequestKind)>,
+    mut playground_msg_rx: mpsc::Receiver<TaggedPlaygroundMessage>,
+    coordinator_msg_tx: mpsc::Sender<TaggedCoordinatorMessage>,
+    kind_tx: mpsc::Sender<TaggedRequestKind>,
 ) -> Result<()> {
     loop {
-        let playground_msg = playground_msg_rx
+        let (id, playground_msg) = playground_msg_rx
             .recv()
             .await
             .context(PlaygroundMessageReceiverEndedSnafu)?;
         match playground_msg {
-            PlaygroundMessage::Request(id, req) => {
+            PlaygroundMessage::Request(req) => {
                 let kind = RequestKind::kind(&req);
                 kind_tx
                     .send((id, kind))
                     .await
                     .context(UnableToSendRequestKindSnafu)?;
                 let job = req.try_into()?;
-                let coordinator_msg = CoordinatorMessage::Request(id, job);
+                let coordinator_msg = CoordinatorMessage::Request(job);
                 coordinator_msg_tx
-                    .send(coordinator_msg)
+                    .send((id, coordinator_msg))
                     .await
                     .context(UnableToSendJobSnafu)?;
             }
@@ -557,28 +561,28 @@ async fn lower_operations(
 }
 
 async fn lift_operation_results(
-    mut worker_msg_rx: mpsc::Receiver<WorkerMessage>,
-    container_msg_tx: mpsc::Sender<ContainerMessage>,
-    mut kind_rx: mpsc::Receiver<(RequestId, RequestKind)>,
+    mut worker_msg_rx: mpsc::Receiver<TaggedWorkerMessage>,
+    container_msg_tx: mpsc::Sender<TaggedContainerMessage>,
+    mut kind_rx: mpsc::Receiver<TaggedRequestKind>,
 ) -> Result<()> {
     let mut request_kinds = HashMap::new();
     loop {
         select! {
             worker_msg = worker_msg_rx.recv() => {
-                let worker_msg = worker_msg.context(WorkerMessageReceiverEndedSnafu)?;
+                let (id, worker_msg) = worker_msg.context(WorkerMessageReceiverEndedSnafu)?;
                 match worker_msg {
-                    WorkerMessage::Response(id, job_report) => {
+                    WorkerMessage::Response(job_report) => {
                         if let Some(kind) = request_kinds.remove(&id) {
                             let response = (job_report, kind).into();
-                            let container_msg = ContainerMessage::Response(id, response);
-                            container_msg_tx.send(container_msg).await.context(UnableToSendContainerResponseSnafu)?;
+                            let container_msg = ContainerMessage::Response(response);
+                            container_msg_tx.send((id, container_msg)).await.context(UnableToSendContainerResponseSnafu)?;
                         }
                     }
                     WorkerMessage::StdoutPacket(cmd_id, data) => {
-                        container_msg_tx.send(ContainerMessage::StdoutPacket(cmd_id, data)).await.context(UnableToSendStdoutPacketSnafu)?;
+                        container_msg_tx.send((id, ContainerMessage::StdoutPacket(cmd_id, data))).await.context(UnableToSendStdoutPacketSnafu)?;
                     }
                     WorkerMessage::StderrPacket(cmd_id, data) => {
-                        container_msg_tx.send(ContainerMessage::StderrPacket(cmd_id, data)).await.context(UnableToSendStderrPacketSnafu)?;
+                        container_msg_tx.send((id, ContainerMessage::StderrPacket(cmd_id, data))).await.context(UnableToSendStderrPacketSnafu)?;
                     }
                 }
             }

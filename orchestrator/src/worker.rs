@@ -15,12 +15,13 @@ use tokio::{
 };
 
 use crate::message::{
-    CommandId, CoordinatorMessage, ExecuteCommandRequest, ExecuteCommandResponse, JobId, JobReport,
-    ReadFileRequest, ReadFileResponse, Request, Response, WorkerMessage, WriteFileRequest,
-    WriteFileResponse,
+    CommandId, CoordinatorMessage, ExecuteCommandRequest, ExecuteCommandResponse, JobReport,
+    MessageId, ReadFileRequest, ReadFileResponse, Request, Response, TaggedCoordinatorMessage,
+    TaggedWorkerMessage, WorkerMessage, WriteFileRequest, WriteFileResponse,
 };
 
-type CommandRequest = (CommandId, ExecuteCommandRequest, Arc<Notify>);
+type JobId = MessageId;
+type CommandRequest = (JobId, CommandId, ExecuteCommandRequest, Arc<Notify>);
 type CancelRequest = JobId;
 
 type Result<T> = std::result::Result<T, Error>;
@@ -66,12 +67,12 @@ pub enum Error {
 
     #[snafu(display("Failed to send stdout packet"))]
     UnableToSendStdoutPacket {
-        source: mpsc::error::SendError<WorkerMessage>,
+        source: mpsc::error::SendError<TaggedWorkerMessage>,
     },
 
     #[snafu(display("Failed to send stderr packet"))]
     UnableToSendStderrPacket {
-        source: mpsc::error::SendError<WorkerMessage>,
+        source: mpsc::error::SendError<TaggedWorkerMessage>,
     },
 
     #[snafu(display("Failed to wait for child process exiting"))]
@@ -79,7 +80,7 @@ pub enum Error {
 
     #[snafu(display("Failed to send coordinator message from deserialization task"))]
     UnableToSendCoordinatorMessage {
-        source: mpsc::error::SendError<CoordinatorMessage>,
+        source: mpsc::error::SendError<TaggedCoordinatorMessage>,
     },
 
     #[snafu(display("Failed to receive coordinator message from deserialization task"))]
@@ -87,7 +88,7 @@ pub enum Error {
 
     #[snafu(display("Failed to send worker message to serialization task"))]
     UnableToSendWorkerMessage {
-        source: mpsc::error::SendError<WorkerMessage>,
+        source: mpsc::error::SendError<TaggedWorkerMessage>,
     },
 
     #[snafu(display("Failed to receive worker message"))]
@@ -126,17 +127,17 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
 
         let project_path = project_dir.as_path();
         loop {
-            let coordinator_msg = coordinator_msg_rx
+            let (job_id, coordinator_msg) = coordinator_msg_rx
                 .recv()
                 .await
                 .context(UnableToReceiveCoordinatorMessageSnafu)?;
             match coordinator_msg {
-                CoordinatorMessage::Request(job_id, job) => {
-                    if let Some((job_id, job_task)) = current_job {
+                CoordinatorMessage::Request(job) => {
+                    if let Some((current_job_id, job_task)) = current_job {
                         job_task.abort();
                         // Kill process started by this job.
                         cancel_tx
-                            .send(job_id)
+                            .send(current_job_id)
                             .await
                             .context(UnableToSendCommandCancellationRequestSnafu)?;
                     }
@@ -147,13 +148,15 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
 
                     let task_handle = tokio::spawn(async move {
                         let mut all_responses = Vec::new();
-                        for (operation_id, req) in job.reqs.into_iter().enumerate() {
+                        let mut cmd_id = 0;
+                        for req in job.reqs.into_iter() {
+                            let is_command_execution = matches!(req, Request::ExecuteCommand(_));
                             let resp = handle_request(
                                 req,
                                 project_path.as_path(),
                                 cmd_tx.clone(),
                                 job_id,
-                                operation_id as u64,
+                                cmd_id,
                             )
                             .await;
                             let success = resp.is_ok();
@@ -161,12 +164,15 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
                             if !success {
                                 break;
                             }
+                            if is_command_execution {
+                                cmd_id += 1;
+                            }
                         }
                         let job_report = JobReport {
                             resps: all_responses,
                         };
                         worker_msg_tx
-                            .send(WorkerMessage::Response(job_id, job_report))
+                            .send((job_id, WorkerMessage::Response(job_report)))
                             .await
                             .context(UnableToSendWorkerMessageSnafu)?;
                         Ok(())
@@ -199,7 +205,7 @@ async fn handle_request(
     project_path: &Path,
     cmd_tx: mpsc::Sender<CommandRequest>,
     job_id: JobId,
-    operation_id: u64,
+    cmd_id: u64,
 ) -> Result<Response> {
     match req {
         Request::WriteFile(WriteFileRequest { path, content }) => {
@@ -223,7 +229,7 @@ async fn handle_request(
         Request::ExecuteCommand(cmd) => {
             let notify = Arc::new(Notify::new());
             cmd_tx
-                .send(((job_id, operation_id), cmd, notify.clone()))
+                .send((job_id, cmd_id, cmd, notify.clone()))
                 .await
                 .context(UnableToSendCommandExecutionRequestSnafu)?;
             notify.notified().await;
@@ -233,7 +239,7 @@ async fn handle_request(
 }
 
 async fn manage_processes(
-    worker_msg_tx: mpsc::Sender<WorkerMessage>,
+    worker_msg_tx: mpsc::Sender<TaggedWorkerMessage>,
     mut cmd_rx: mpsc::Receiver<CommandRequest>,
     mut cancel_rx: mpsc::Receiver<CancelRequest>,
     project_path: PathBuf,
@@ -242,7 +248,7 @@ async fn manage_processes(
     loop {
         select! {
             cmd_req = cmd_rx.recv() => {
-                let (cmd_id, req, response_tx) = cmd_req.context(CommandRequestReceiverEndedSnafu)?;
+                let (job_id, cmd_id, req, response_tx) = cmd_req.context(CommandRequestReceiverEndedSnafu)?;
                 let ExecuteCommandRequest {
                     cmd,
                     args,
@@ -259,13 +265,13 @@ async fn manage_processes(
                     .spawn()
                     .context(UnableToSpawnProcessSnafu)?;
 
-                let mut task_set = stream_stdio(worker_msg_tx.clone(), &mut child, cmd_id)?;
+                let mut task_set = stream_stdio(worker_msg_tx.clone(), &mut child, job_id, cmd_id)?;
                 task_set.spawn(async move {
                     child.wait().await.context(WaitChildSnafu)?;
                     response_tx.notify_one();
                     Ok(())
                 });
-                processes.insert(cmd_id.0, task_set);
+                processes.insert(job_id, task_set);
             },
             job_id = cancel_rx.recv() => {
                 let job_id = job_id.context(CancelRequestReceiverEndedSnafu)?;
@@ -278,8 +284,9 @@ async fn manage_processes(
 }
 
 fn stream_stdio(
-    coordinator_tx: mpsc::Sender<WorkerMessage>,
+    coordinator_tx: mpsc::Sender<TaggedWorkerMessage>,
     child: &mut Child,
+    job_id: JobId,
     cmd_id: CommandId,
 ) -> Result<JoinSet<Result<()>>> {
     let stdout = child.stdout.take().context(UnableToCaptureStdoutSnafu)?;
@@ -299,7 +306,7 @@ fn stream_stdio(
                 .context(UnableToReadStdoutSnafu)?;
             if n != 0 {
                 coordinator_tx_out
-                    .send(WorkerMessage::StdoutPacket(cmd_id, buffer))
+                    .send((job_id, WorkerMessage::StdoutPacket(cmd_id, buffer)))
                     .await
                     .context(UnableToSendStdoutPacketSnafu)?;
             } else {
@@ -320,7 +327,7 @@ fn stream_stdio(
                 .context(UnableToReadStderrSnafu)?;
             if n != 0 {
                 coordinator_tx_err
-                    .send(WorkerMessage::StderrPacket(cmd_id, buffer))
+                    .send((job_id, WorkerMessage::StderrPacket(cmd_id, buffer)))
                     .await
                     .context(UnableToSendStderrPacketSnafu)?;
             } else {
@@ -335,8 +342,8 @@ fn stream_stdio(
 // stdin/out <--> messages.
 fn spawn_io_queue(
     tasks: &mut JoinSet<Result<()>>,
-    coordinator_msg_tx: mpsc::Sender<CoordinatorMessage>,
-    mut worker_msg_rx: mpsc::Receiver<WorkerMessage>,
+    coordinator_msg_tx: mpsc::Sender<TaggedCoordinatorMessage>,
+    mut worker_msg_rx: mpsc::Receiver<TaggedWorkerMessage>,
 ) {
     use std::io::{prelude::*, BufReader, BufWriter};
 

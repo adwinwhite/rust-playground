@@ -3,10 +3,13 @@ use std::collections::HashMap;
 
 use crate::worker;
 
-pub type JobId = u64;
+pub type MessageId = u64;
+pub type CommandId = u64;
 pub type Path = String;
 pub type ResponseError = String;
-pub type CommandId = (JobId, u64);
+
+pub type TaggedCoordinatorMessage = (MessageId, CoordinatorMessage);
+pub type TaggedWorkerMessage = (MessageId, WorkerMessage);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Job {
@@ -30,12 +33,12 @@ impl JobReport {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CoordinatorMessage {
-    Request(JobId, Job),
+    Request(Job),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerMessage {
-    Response(JobId, JobReport),
+    Response(JobReport),
     StdoutPacket(CommandId, String),
     StderrPacket(CommandId, String),
 }
